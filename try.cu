@@ -10,7 +10,7 @@
 const int MAXN = 100005;
 const int LOG = 17;  
 const int BLOCK_SIZE = 256;
-const int SHARED_MEM_SIZE = 1024;  // Adjust based on GPU capabilities
+const int SHARED_MEM_SIZE = 1024; 
 
 typedef long long ll;
 
