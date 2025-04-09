@@ -1,0 +1,360 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <algorithm>
+#include <limits.h>
+#include <cuda_runtime.h>
+
+// Constants
+#define MAXN 100005
+#define LOG 17
+#define INF 1000000000
+
+// Structures
+struct Edge {
+    int u, v, w, id;
+    bool inMST;
+};
+
+// Helper functions
+void checkCudaError(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s: %s\n", msg, cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Device functions for Union-Find
+__device__ int find(int* parent, int x) {
+    if (parent[x] == x) return x;
+    parent[x] = find(parent, parent[x]);
+    return parent[x];
+}
+
+__device__ bool unite(int* parent, int* size, int u, int v) {
+    u = find(parent, u);
+    v = find(parent, v);
+    if (u == v) return false;
+    if (size[u] < size[v]) {
+        int temp = u;
+        u = v;
+        v = temp;
+    }
+    parent[v] = u;
+    size[u] += size[v];
+    return true;
+}
+
+// Initialization kernel
+__global__ void initDSUKernel(int* parent, int* size, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx <= n) {
+        parent[idx] = idx;
+        size[idx] = 1;
+    }
+}
+
+// MST building kernel - Fixed atomicAdd for long long
+__global__ void buildMSTKernel(Edge* edges, int m, int* parent, int* size, int* adj_list, 
+                               int* adj_weights, int* adj_count, long long* MST_weight) {
+    for (int i = 0; i < m; i++) {
+        Edge& e = edges[i];
+        if (unite(parent, size, e.u, e.v)) {
+            e.inMST = true;
+            // Use atomicAdd for integer, then update MST_weight manually
+            atomicAdd((unsigned long long*)MST_weight, (unsigned long long)e.w);
+            
+            // Add to adjacency list
+            int u = e.u;
+            int v = e.v;
+            int idx_u = atomicAdd(&adj_count[u], 1);
+            int idx_v = atomicAdd(&adj_count[v], 1);
+            
+            adj_list[u * MAXN + idx_u] = v;
+            adj_weights[u * MAXN + idx_u] = e.w;
+            
+            adj_list[v * MAXN + idx_v] = u;
+            adj_weights[v * MAXN + idx_v] = e.w;
+        }
+    }
+}
+
+// DFS kernel for setting up binary lifting
+__global__ void dfsInitKernel(int* depth, int* parent, int root) {
+    depth[root] = 0;
+    parent[root] = root;
+}
+
+// Helper function to perform DFS (called from host)
+void dfs(int u, int p, int w, int* depth, int** up, int** maxEdge, int* adj_list, int* adj_weights, int* adj_count) {
+    // Set first ancestor
+    up[0][u] = p;
+    maxEdge[0][u] = w;
+    
+    // Visit children
+    for (int i = 0; i < adj_count[u]; ++i) {
+        int v = adj_list[u * MAXN + i];
+        int edge_weight = adj_weights[u * MAXN + i];
+        if (v != p) {
+            depth[v] = depth[u] + 1;
+            dfs(v, u, edge_weight, depth, up, maxEdge, adj_list, adj_weights, adj_count);
+        }
+    }
+}
+
+// Initialize binary lifting tables
+void initBinaryLifting(int n, int** up, int** maxEdge) {
+    // Compute binary lifting table
+    for (int i = 1; i < LOG; ++i) {
+        for (int j = 1; j <= n; ++j) {
+            int anc = up[i-1][j];
+            up[i][j] = up[i-1][anc];
+            maxEdge[i][j] = std::max(maxEdge[i-1][j], maxEdge[i-1][anc]);
+        }
+    }
+}
+
+// Device function to get max edge on path
+__device__ int getMaxEdge(int u, int v, int* depth, int* up, int* maxEdge) {
+    // Ensure u is deeper
+    if (depth[u] < depth[v]) {
+        int temp = u;
+        u = v;
+        v = temp;
+    }
+    
+    int maxE = 0;
+    
+    // Bring u and v to same depth
+    int diff = depth[u] - depth[v];
+    for (int i = 0; i < LOG; ++i) {
+        if ((diff >> i) & 1) {
+            maxE = max(maxE, maxEdge[i * MAXN + u]);
+            u = up[i * MAXN + u];
+        }
+    }
+    
+    if (u == v) return maxE;
+    
+    // Find LCA
+    for (int i = LOG-1; i >= 0; --i) {
+        if (up[i * MAXN + u] != up[i * MAXN + v]) {
+            maxE = max(maxE, max(maxEdge[i * MAXN + u], maxEdge[i * MAXN + v]));
+            u = up[i * MAXN + u];
+            v = up[i * MAXN + v];
+        }
+    }
+    
+    // Include the final step to LCA
+    maxE = max(maxE, max(maxEdge[0 * MAXN + u], maxEdge[0 * MAXN + v]));
+    
+    return maxE;
+}
+
+// Kernel to compute MST changes for each edge - Fixed parent reference
+__global__ void computeEdgeMSTKernel(Edge* edges, int m, long long MST_weight, int* depth, 
+                                     int* up, int* maxEdge, long long* results, int* parent) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < m) {
+        Edge& e = edges[idx];
+        
+        if (e.inMST) {
+            // Edge in MST: if removed, find replacement
+            long long best = LLONG_MAX;
+            
+            for (int j = 0; j < m; j++) {
+                if (j != idx && !edges[j].inMST) {
+                    // Check if this edge can reconnect the MST
+                    int u = find(parent, edges[j].u);
+                    int v = find(parent, edges[j].v);
+                    if (u != v) {
+                        best = min(best, MST_weight - e.w + edges[j].w);
+                    }
+                }
+            }
+            
+            results[e.id] = (best == LLONG_MAX) ? -1 : best; // -1 means no MST possible
+        } else {
+            // Edge not in MST: if added, find cycle and replace max edge
+            int maxE = getMaxEdge(e.u, e.v, depth, up, maxEdge);
+            if (e.w >= maxE) {
+                // No improvement possible
+                results[e.id] = MST_weight;
+            } else {
+                // Can improve by replacing maxE with this edge
+                results[e.id] = MST_weight - maxE + e.w;
+            }
+        }
+    }
+}
+
+int main() {
+    // Read input
+    int n, m;
+    scanf("%d %d", &n, &m);
+    
+    // Allocate host memory
+    Edge* h_edges = (Edge*)malloc(m * sizeof(Edge));
+    int* h_depth = (int*)malloc((n+1) * sizeof(int));
+    int* h_adj_list = (int*)malloc((n+1) * MAXN * sizeof(int));
+    int* h_adj_weights = (int*)malloc((n+1) * MAXN * sizeof(int));
+    int* h_adj_count = (int*)calloc((n+1), sizeof(int));
+    int* h_parent = (int*)malloc((n+1) * sizeof(int));
+    
+    int** h_up = new int*[LOG];
+    int** h_maxEdge = new int*[LOG];
+    for (int i = 0; i < LOG; ++i) {
+        h_up[i] = (int*)malloc((n+1) * sizeof(int));
+        h_maxEdge[i] = (int*)malloc((n+1) * sizeof(int));
+    }
+    
+    // Read edges
+    for (int i = 0; i < m; ++i) {
+        scanf("%d %d %d", &h_edges[i].u, &h_edges[i].v, &h_edges[i].w);
+        h_edges[i].id = i;
+        h_edges[i].inMST = false;
+    }
+    
+    // Allocate device memory
+    Edge* d_edges;
+    int* d_parent;
+    int* d_size;
+    int* d_adj_list;
+    int* d_adj_weights;
+    int* d_adj_count;
+    int* d_depth;
+    int* d_up;
+    int* d_maxEdge;
+    long long* d_MST_weight;
+    long long* d_results;
+    
+    checkCudaError(cudaMalloc(&d_edges, m * sizeof(Edge)), "Allocate edges");
+    checkCudaError(cudaMalloc(&d_parent, (n+1) * sizeof(int)), "Allocate parent");
+    checkCudaError(cudaMalloc(&d_size, (n+1) * sizeof(int)), "Allocate size");
+    checkCudaError(cudaMalloc(&d_adj_list, (n+1) * MAXN * sizeof(int)), "Allocate adj list");
+    checkCudaError(cudaMalloc(&d_adj_weights, (n+1) * MAXN * sizeof(int)), "Allocate adj weights");
+    checkCudaError(cudaMalloc(&d_adj_count, (n+1) * sizeof(int)), "Allocate adj count");
+    checkCudaError(cudaMalloc(&d_depth, (n+1) * sizeof(int)), "Allocate depth");
+    checkCudaError(cudaMalloc(&d_up, LOG * MAXN * sizeof(int)), "Allocate up");
+    checkCudaError(cudaMalloc(&d_maxEdge, LOG * MAXN * sizeof(int)), "Allocate maxEdge");
+    checkCudaError(cudaMalloc(&d_MST_weight, sizeof(long long)), "Allocate MST weight");
+    checkCudaError(cudaMalloc(&d_results, m * sizeof(long long)), "Allocate results");
+    
+    // Initialize device memory
+    checkCudaError(cudaMemcpy(d_edges, h_edges, m * sizeof(Edge), cudaMemcpyHostToDevice), "Copy edges");
+    checkCudaError(cudaMemset(d_adj_count, 0, (n+1) * sizeof(int)), "Init adj count");
+    long long init_mst = 0;
+    checkCudaError(cudaMemcpy(d_MST_weight, &init_mst, sizeof(long long), cudaMemcpyHostToDevice), "Init MST weight");
+    
+    // Sort edges by weight
+    std::sort(h_edges, h_edges + m, [](const Edge& a, const Edge& b) { return a.w < b.w; });
+    checkCudaError(cudaMemcpy(d_edges, h_edges, m * sizeof(Edge), cudaMemcpyHostToDevice), "Copy sorted edges");
+    
+    // Initialize DSU
+    int blockSize = 256;
+    int numBlocks = (n + blockSize - 1) / blockSize;
+    initDSUKernel<<<numBlocks, blockSize>>>(d_parent, d_size, n);
+    cudaDeviceSynchronize();
+    
+    // Build MST
+    buildMSTKernel<<<1, 1>>>(d_edges, m, d_parent, d_size, d_adj_list, d_adj_weights, d_adj_count, d_MST_weight);
+    cudaDeviceSynchronize();
+    
+    // Copy back MST edges and adjacency information
+    long long MST_weight;
+    checkCudaError(cudaMemcpy(h_edges, d_edges, m * sizeof(Edge), cudaMemcpyDeviceToHost), "Copy edges back");
+    checkCudaError(cudaMemcpy(&MST_weight, d_MST_weight, sizeof(long long), cudaMemcpyDeviceToHost), "Copy MST weight");
+    checkCudaError(cudaMemcpy(h_adj_list, d_adj_list, (n+1) * MAXN * sizeof(int), cudaMemcpyDeviceToHost), "Copy adj list");
+    checkCudaError(cudaMemcpy(h_adj_weights, d_adj_weights, (n+1) * MAXN * sizeof(int), cudaMemcpyDeviceToHost), "Copy adj weights");
+    checkCudaError(cudaMemcpy(h_adj_count, d_adj_count, (n+1) * sizeof(int), cudaMemcpyDeviceToHost), "Copy adj count");
+    checkCudaError(cudaMemcpy(h_parent, d_parent, (n+1) * sizeof(int), cudaMemcpyDeviceToHost), "Copy parent");
+    
+    // Initialize depth array for root
+    memset(h_depth, 0, (n+1) * sizeof(int));
+    h_depth[1] = 0;
+    
+    // DFS to build the tree structure
+    dfs(1, 1, 0, h_depth, h_up, h_maxEdge, h_adj_list, h_adj_weights, h_adj_count);
+    
+    // Initialize binary lifting tables
+    initBinaryLifting(n, h_up, h_maxEdge);
+    
+    // Prepare flattened binary lifting tables for GPU
+    int* flat_up = (int*)malloc(LOG * MAXN * sizeof(int));
+    int* flat_maxEdge = (int*)malloc(LOG * MAXN * sizeof(int));
+    
+    for (int i = 0; i < LOG; ++i) {
+        for (int j = 1; j <= n; ++j) {
+            flat_up[i * MAXN + j] = h_up[i][j];
+            flat_maxEdge[i * MAXN + j] = h_maxEdge[i][j];
+        }
+    }
+    
+    // Copy binary lifting tables to device
+    checkCudaError(cudaMemcpy(d_depth, h_depth, (n+1) * sizeof(int), cudaMemcpyHostToDevice), "Copy depth");
+    checkCudaError(cudaMemcpy(d_up, flat_up, LOG * MAXN * sizeof(int), cudaMemcpyHostToDevice), "Copy up");
+    checkCudaError(cudaMemcpy(d_maxEdge, flat_maxEdge, LOG * MAXN * sizeof(int), cudaMemcpyHostToDevice), "Copy maxEdge");
+    
+    // Compute MST changes for each edge
+    numBlocks = (m + blockSize - 1) / blockSize;
+    computeEdgeMSTKernel<<<numBlocks, blockSize>>>(d_edges, m, MST_weight, d_depth, d_up, d_maxEdge, d_results, d_parent);
+    cudaDeviceSynchronize();
+    
+    // Copy results back
+    long long* results = (long long*)malloc(m * sizeof(long long));
+    checkCudaError(cudaMemcpy(results, d_results, m * sizeof(long long), cudaMemcpyDeviceToHost), "Copy results");
+    
+    // Sort edges back to original order
+    std::sort(h_edges, h_edges + m, [](const Edge& a, const Edge& b) { return a.id < b.id; });
+    
+    // Print results
+    printf("Original MST weight: %lld\n", MST_weight);
+    printf("\nDynamic MST Updates for Each Edge:\n");
+    
+    for (int i = 0; i < m; ++i) {
+        Edge& e = h_edges[i];
+        printf("Edge %d: %d-%d (weight=%d) - ", e.id + 1, e.u, e.v, e.w);
+        
+        if (e.inMST) {
+            printf("In MST, if removed: ");
+            if (results[e.id] == -1) {
+                printf("No MST possible\n");
+            } else {
+                printf("New MST weight = %lld\n", results[e.id]);
+            }
+        } else {
+            printf("Not in MST, if added: New MST weight = %lld\n", results[e.id]);
+        }
+    }
+    
+    // Free memory
+    free(h_edges);
+    free(h_depth);
+    free(h_adj_list);
+    free(h_adj_weights);
+    free(h_adj_count);
+    free(h_parent);
+    free(flat_up);
+    free(flat_maxEdge);
+    free(results);
+    
+    for (int i = 0; i < LOG; ++i) {
+        free(h_up[i]);
+        free(h_maxEdge[i]);
+    }
+    delete[] h_up;
+    delete[] h_maxEdge;
+    
+    cudaFree(d_edges);
+    cudaFree(d_parent);
+    cudaFree(d_size);
+    cudaFree(d_adj_list);
+    cudaFree(d_adj_weights);
+    cudaFree(d_adj_count);
+    cudaFree(d_depth);
+    cudaFree(d_up);
+    cudaFree(d_maxEdge);
+    cudaFree(d_MST_weight);
+    cudaFree(d_results);
+    
+    return 0;
+}
